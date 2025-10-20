@@ -25,7 +25,19 @@ jobs:
           python-version: '3.11'
 
       - name: Install deps
-        run: pip install requests
+        run: |
+          pip install requests tzdata
+
+      - name: Debug env (non-secret)
+        run: |
+          echo "HOME_CITY=${{ vars.HOME_CITY }}"
+          echo "EXCLUDE_CITY=${{ vars.EXCLUDE_CITY }}"
+          echo "RADIUS_KM=${{ vars.RADIUS_KM }}"
+          echo "SALARY_MIN_YEAR=${{ vars.SALARY_MIN_YEAR }}"
+          echo "KEYWORDS=${{ vars.KEYWORDS }}"
+          echo "EXCLUDE_TERMS=${{ vars.EXCLUDE_TERMS }}"
+          echo "ADZUNA_MAX_PAGES=${{ vars.ADZUNA_MAX_PAGES }}"
+          echo "RESULTS_PER_PAGE=${{ vars.RESULTS_PER_PAGE }}"
 
       - name: Generate site
         env:
