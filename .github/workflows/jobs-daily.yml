@@ -1,0 +1,61 @@
+name: jobs-daily
+
+on:
+  schedule:
+    - cron: '20 5 * * *'  # täglich ~07:20 Europe/Berlin (UTC beachten)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: 'pages'
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Generate site
+        env:
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
+          EURES_CLIENT_ID: ${{ secrets.EURES_CLIENT_ID }}
+          EURES_CLIENT_SECRET: ${{ secrets.EURES_CLIENT_SECRET }}
+          HOME_CITY: ${{ vars.HOME_CITY }}
+          EXCLUDE_CITY: ${{ vars.EXCLUDE_CITY }}
+          RADIUS_KM: ${{ vars.RADIUS_KM }}
+          SALARY_MIN_YEAR: ${{ vars.SALARY_MIN_YEAR }}
+          KEYWORDS: ${{ vars.KEYWORDS }}
+          EXCLUDE_TERMS: ${{ vars.EXCLUDE_TERMS }}
+          ADZUNA_MAX_PAGES: ${{ vars.ADZUNA_MAX_PAGES }}
+          RESULTS_PER_PAGE: ${{ vars.RESULTS_PER_PAGE }}
+        run: |
+          python scripts/fetch_and_build.py
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
