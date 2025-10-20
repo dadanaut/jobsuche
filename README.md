@@ -1,2 +1,2 @@
-# jobsuche
-Automatische Suche nach eventuell passenden Jobs
+# Jobsuche
+Automatische Suche nach eventuell passenden Jobs.
