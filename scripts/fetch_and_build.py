@@ -4,11 +4,13 @@ import re
 import json
 import time
 import html
-import math
 import requests
 from pathlib import Path
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # Fallback, wenn nicht verfügbar
 
 COUNTRY = "de"
 ADZUNA_BASE = f"https://api.adzuna.com/v1/api/jobs/{COUNTRY}/search"
@@ -22,6 +24,21 @@ def parse_list_semicolons(s, default=None):
         return default or []
     return [x.strip() for x in s.split(";") if x.strip()]
 
+def parse_int_flexible(value, default):
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(float(value))
+    s = str(value).strip()
+    # entferne alles außer Ziffern
+    s = re.sub(r"[^0-9]", "", s)
+    if not s:
+        return default
+    try:
+        return int(s)
+    except Exception:
+        return default
+
 def normalize(s):
     return (s or "").strip()
 
@@ -34,7 +51,6 @@ def contains_any(text, terms):
 def clean_text(s, max_len=350):
     if not s:
         return ""
-    # Collapse whitespace
     s = re.sub(r"\s+", " ", s).strip()
     s = html.escape(s)
     if len(s) > max_len:
@@ -43,6 +59,14 @@ def clean_text(s, max_len=350):
 
 def ensure_dir(p):
     Path(p).mkdir(parents=True, exist_ok=True)
+
+def get_berlin_tz():
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo("Europe/Berlin")
+    except Exception:
+        return None
 
 def fetch_adzuna_page(keyword, page, cfg):
     params = {
@@ -53,37 +77,34 @@ def fetch_adzuna_page(keyword, page, cfg):
         "distance": cfg["RADIUS_KM"],
         "sort_by": "date",
         "results_per_page": cfg["RESULTS_PER_PAGE"],
-        # Optional und konservativ: wir überlassen Gehaltsfilterung der Nachlogik,
-        # damit Anzeigen ohne Gehalt nicht verloren gehen.
-        # "salary_min": cfg["SALARY_MIN_YEAR"],
-        # Ein enger Ausschluss-Parameter (breitere Synonyme post-filter):
         "what_exclude": "Zeitarbeit",
-        "page": page,
+        # Adzuna nutzt die Seitenzahl im Pfad (…/search/{page}), daher kein zusätzliches "page" hier nötig.
     }
     url = f"{ADZUNA_BASE}/{page}"
-    resp = requests.get(url, params=params, timeout=20)
+    headers = {"User-Agent": "MarcoJobBot/1.0 (+GitHub Actions)"}
+    resp = requests.get(url, params=params, headers=headers, timeout=25)
     resp.raise_for_status()
     return resp.json()
 
 def job_city_mentions_excluded(job, exclude_city):
-    # Prüfe location.display_name und location.area
+    if not exclude_city:
+        return False
     loc = job.get("location") or {}
     disp = normalize(loc.get("display_name"))
-    if exclude_city and exclude_city.casefold() in disp.casefold():
+    if exclude_city.casefold() in disp.casefold():
         return True
     area = loc.get("area") or []
     for a in area:
-        if exclude_city and exclude_city.casefold() in str(a).casefold():
+        if exclude_city.casefold() in str(a).casefold():
             return True
     # Fallback: Titel/Beschreibung
     title = normalize(job.get("title"))
     desc = normalize(job.get("description"))
-    if exclude_city and (exclude_city.casefold() in title.casefold() or exclude_city.casefold() in desc.casefold()):
+    if exclude_city.casefold() in title.casefold() or exclude_city.casefold() in desc.casefold():
         return True
     return False
 
 def extract_annual_salary(job):
-    # Adzuna liefert salary_min/salary_max (jährlich) oder predicted.
     smin = job.get("salary_min")
     smax = job.get("salary_max")
     return (smin, smax)
@@ -92,7 +113,7 @@ def meets_min_salary(job, min_year):
     smin, smax = extract_annual_salary(job)
     if smin is None and smax is None:
         return None  # unbekannt
-    # Wenn nur eins vorhanden ist, nutze das vorhandene Feld
+    # wenn nur eines vorhanden ist
     val = smax if smax is not None else smin
     try:
         return float(val) >= float(min_year)
@@ -104,11 +125,14 @@ def build_job_obj(raw, cfg):
     comp = raw.get("company") or {}
     smin, smax = extract_annual_salary(raw)
     created_iso = normalize(raw.get("created"))
+
+    # ISO -> datetime
     created_dt = None
-    try:
-        created_dt = datetime.fromisoformat(created_iso.replace("Z", "+00:00"))
-    except Exception:
-        pass
+    if created_iso:
+        try:
+            created_dt = datetime.fromisoformat(created_iso.replace("Z", "+00:00"))
+        except Exception:
+            created_dt = None
 
     job = {
         "id": raw.get("id"),
@@ -130,13 +154,16 @@ def build_job_obj(raw, cfg):
     }
 
     if created_dt:
+        berlin = get_berlin_tz()
         try:
-            berlin = ZoneInfo("Europe/Berlin")
-            job["created_local"] = created_dt.astimezone(berlin).strftime("%d.%m.%Y %H:%M")
+            if berlin:
+                job["created_local"] = created_dt.astimezone(berlin).strftime("%d.%m.%Y %H:%M")
+            else:
+                job["created_local"] = created_dt.strftime("%Y-%m-%d %H:%M UTC")
         except Exception:
             job["created_local"] = created_dt.strftime("%Y-%m-%d %H:%M UTC")
 
-    # Flags
+    # Heuristik Remote
     job["is_remote_guess"] = contains_any(
         " ".join([job["title"], job["description"]]),
         ["remote", "homeoffice", "home office", "hybrid", "teil-remote"]
@@ -149,7 +176,6 @@ def should_exclude(job, cfg):
     # Stadt-Ausschluss
     if cfg["EXCLUDE_CITY"] and job_city_mentions_excluded(job, cfg["EXCLUDE_CITY"]):
         return True, "excluded_city"
-
     # Zeitarbeit & Synonyme
     hay = " ".join([job["title"], job["company"], job["description"]]).casefold()
     for term in cfg["EXCLUDE_TERMS"]:
@@ -158,7 +184,7 @@ def should_exclude(job, cfg):
     return False, None
 
 def rank_job(job):
-    # Ranking: 2 (Gehalt ok) > 1 (unbekannt) > 0 (unter Minimum)
+    # 2 (Gehalt ok) > 1 (unbekannt) > 0 (unter Minimum)
     if job["meets_salary"] is True:
         return 2
     if job["meets_salary"] is None:
@@ -171,17 +197,24 @@ def main():
         "ADZUNA_APP_KEY": getenv("ADZUNA_APP_KEY"),
         "HOME_CITY": getenv("HOME_CITY", "Lauffen am Neckar"),
         "EXCLUDE_CITY": getenv("EXCLUDE_CITY", "Stuttgart"),
-        "RADIUS_KM": int(getenv("RADIUS_KM", "30")),
-        "SALARY_MIN_YEAR": int(getenv("SALARY_MIN_YEAR", "54000")),
+        "RADIUS_KM": parse_int_flexible(getenv("RADIUS_KM", "30"), 30),
+        "SALARY_MIN_YEAR": parse_int_flexible(getenv("SALARY_MIN_YEAR", "54000"), 54000),
         "KEYWORDS": parse_list_semicolons(getenv("KEYWORDS"), [
             "Mediengestalter", "Webdesigner", "WordPress", "TYPO3", "SEO", "Content Manager", "Social Media", "Digital Marketing"
         ]),
         "EXCLUDE_TERMS": parse_list_semicolons(getenv("EXCLUDE_TERMS"), [
             "Zeitarbeit", "Leiharbeit", "Arbeitnehmerüberlassung", "Personaldienstleister", "Personalleasing"
         ]),
-        "ADZUNA_MAX_PAGES": int(getenv("ADZUNA_MAX_PAGES", "2")),
-        "RESULTS_PER_PAGE": int(getenv("RESULTS_PER_PAGE", "50")),
+        "ADZUNA_MAX_PAGES": parse_int_flexible(getenv("ADZUNA_MAX_PAGES", "2"), 2),
+        "RESULTS_PER_PAGE": parse_int_flexible(getenv("RESULTS_PER_PAGE", "50"), 50),
     }
+
+    # Minimal-Config-Log (ohne Secrets)
+    print("[INFO] Effektive Konfiguration:")
+    print(f"  HOME_CITY={cfg['HOME_CITY']}, EXCLUDE_CITY={cfg['EXCLUDE_CITY']}, RADIUS_KM={cfg['RADIUS_KM']}")
+    print(f"  SALARY_MIN_YEAR={cfg['SALARY_MIN_YEAR']}, ADZUNA_MAX_PAGES={cfg['ADZUNA_MAX_PAGES']}, RESULTS_PER_PAGE={cfg['RESULTS_PER_PAGE']}")
+    print(f"  KEYWORDS={cfg['KEYWORDS']}")
+    print(f"  EXCLUDE_TERMS={cfg['EXCLUDE_TERMS']}")
 
     if not cfg["ADZUNA_APP_ID"] or not cfg["ADZUNA_APP_KEY"]:
         raise RuntimeError("ADZUNA_APP_ID / ADZUNA_APP_KEY fehlen als Secrets/Env.")
@@ -211,11 +244,9 @@ def main():
                 seen_ids.add(rid)
                 all_raw.append((kw, r))
                 total_for_kw += 1
-            # kurze Pause für Rate-Limit
-            time.sleep(0.3)
+            time.sleep(0.3)  # Rate-Limit-Schonung
         per_keyword_count[kw] = total_for_kw
 
-    # Transform + Filter
     kept = []
     excluded = []
     for kw, raw in all_raw:
@@ -228,14 +259,11 @@ def main():
         else:
             kept.append(job)
 
-    # Sortierung
     kept.sort(key=lambda j: (-rank_job(j), j["company"].casefold(), j["title"].casefold()))
 
-    # Ausgaben vorbereiten
     ensure_dir("site")
     ensure_dir("site/data")
 
-    # JSON speichern
     output = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "home_city": cfg["HOME_CITY"],
@@ -257,19 +285,31 @@ def main():
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     # HTML bauen
-    berlin = ZoneInfo("Europe/Berlin")
-    now_local = datetime.now(berlin).strftime("%d.%m.%Y %H:%M")
+    try:
+        berlin = get_berlin_tz()
+        now_dt = datetime.now(timezone.utc)
+        if berlin:
+            now_local = now_dt.astimezone(berlin).strftime("%d.%m.%Y %H:%M")
+        else:
+            now_local = now_dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        now_local = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
     total = len(kept)
     kept_cards = []
     for j in kept:
         salary_txt = "Gehaltsangabe: unbekannt"
-        if j["salary_min"] or j["salary_max"]:
-            parts = []
-            if j["salary_min"]:
-                parts.append(f"min €{int(j['salary_min']):,}".replace(",", "."))
-            if j["salary_max"]:
-                parts.append(f"max €{int(j['salary_max']):,}".replace(",", "."))
-            salary_txt = " / ".join(parts) + " p.a."
+        try:
+            if j["salary_min"] or j["salary_max"]:
+                parts = []
+                if j["salary_min"]:
+                    parts.append(f"min €{int(float(j['salary_min'])):,}".replace(",", "."))
+                if j["salary_max"]:
+                    parts.append(f"max €{int(float(j['salary_max'])):,}".replace(",", "."))
+                salary_txt = " / ".join(parts) + " p.a."
+        except Exception:
+            pass
+
         badge = ""
         if j["meets_salary"] is True:
             badge = '<span class="badge good">≥ Mindestgehalt</span>'
@@ -278,18 +318,23 @@ def main():
         else:
             badge = '<span class="badge warn">unter Mindestgehalt</span>'
 
-        remote = ' <span class="pill">Remote/HYB</span>' if j["is_remote_guess"] else ""
+        remote = ' <span class="pill">Remote/HYB</span>' if j.get("is_remote_guess") else ""
         created = j.get("created_local") or (j.get("created") or "")[:16]
+        desc = clean_text(j.get("description"), max_len=360)
+        title = html.escape(j.get("title") or "")
+        company = html.escape(j.get("company") or "")
+        location = html.escape(j.get("location") or "")
+        redirect = html.escape(j.get("redirect_url") or "#")
+        keyword = html.escape(j.get("keyword") or "")
 
-        desc = clean_text(j["description"], max_len=360)
         card = f"""
         <article class="card">
-          <h3>{html.escape(j['title'])}</h3>
-          <p class="meta">{html.escape(j['company'])} · {html.escape(j['location'])}{remote}</p>
-          <p class="meta">Quelle: {j['source']} · Erstellt: {html.escape(created)} · Schlagwort: {html.escape(j['keyword'])}</p>
+          <h3>{title}</h3>
+          <p class="meta">{company} · {location}{remote}</p>
+          <p class="meta">Quelle: Adzuna · Erstellt: {html.escape(created)} · Schlagwort: {keyword}</p>
           <p class="salary">{salary_txt} {badge}</p>
           <p class="desc">{desc}</p>
-          <p><a class="btn" href="{html.escape(j['redirect_url'] or '#')}" target="_blank" rel="noopener">Zur Ausschreibung</a></p>
+          <p><a class="btn" href="{redirect}" target="_blank" rel="noopener">Zur Ausschreibung</a></p>
         </article>
         """
         kept_cards.append(card)
@@ -355,11 +400,10 @@ def main():
 </body>
 </html>
 """
-
     with open("site/index.html", "w", encoding="utf-8") as f:
         f.write(html_doc)
 
-    print(f"[OK] {len(all_raw)} Rohanzeigen, {len(kept)} nach Filtern. HTML & JSON erzeugt.")
+    print(f"[OK] Rohanzeigen: {len(all_raw)}, nach Filtern: {len(kept)}. HTML & JSON erzeugt.")
 
 if __name__ == "__main__":
     main()
